@@ -636,6 +636,11 @@ pub struct AppView {
     /// Pending exit-session confirmation for slash command path.
     /// Set when `/home` is first typed; confirmed on second invocation within TTL.
     pub exit_session_pending: Option<Instant>,
+    /// Set on `FocusLost`, consumed on `FocusGained`. Gates idle "restore
+    /// Prompt" so a click into scrollback is not undone by a spurious
+    /// FocusGained (VS Code / mouse-mode focus reports) while the terminal
+    /// stays focused. True external tab-away still sets this via FocusLost.
+    pub(crate) saw_focus_lost: bool,
     /// Mouse scroll normalization state (wheel/trackpad detection, acceleration).
     /// App-level because scroll is a physical input property, not per-agent.
     pub scroll_state: MouseScrollState,
@@ -1459,6 +1464,7 @@ impl AppView {
             pending_notification_escapes: None,
             deferred_notification: None,
             tracing_rx: None,
+            saw_focus_lost: false,
             scroll_debug_hud: crate::views::scroll_debug_hud::ScrollDebugHud::new(),
             fps_hud: crate::views::fps_hud::FpsHud::new(),
             active_announcements: Vec::new(),
@@ -2436,6 +2442,9 @@ impl AppView {
             _ => None,
         };
         if let Event::Resize(_, rows) = ev {
+            // Same drain-coalesced mouse repair as FocusGained (flushed once
+            // after the event batch). Fallback when focus never fires.
+            super::request_mouse_reassert();
             for agent in self.agents.values_mut() {
                 agent.note_terminal_resize();
                 for child in agent.subagent_views.values_mut() {

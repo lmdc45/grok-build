@@ -3371,6 +3371,8 @@ async fn drain_and_process(
         let ev = &routed.event;
         match ev {
             Event::FocusGained => {
+                // Coalesce mouse repair to one write at end of this drain.
+                super::request_mouse_reassert();
                 // Force a full repaint on refocus to heal out-of-band stranded rows.
                 // Sets needs_draw (not had_non_resize_change); the draw site honors force_repaint
                 // ahead of the resize debounce, clearing even a coalesced same-size resize.
@@ -3403,15 +3405,26 @@ async fn drain_and_process(
                 if process_effects(effs, tasks, app, progress_tx) {
                     return true;
                 }
-                // Restore Prompt on refocus: needs-input overlay always, else idle non-vim.
+                // Restore Prompt on *external* refocus (Alt-Tab back), not on
+                // every FocusGained while the terminal stays focused. Spurious
+                // FocusGained (mouse modes / VS Code) was undoing click-to-
+                // scrollback so the user felt stuck in the input forever.
+                // Needs-input overlays still restore even without FocusLost.
+                let external_focus = std::mem::take(&mut app.saw_focus_lost);
                 match app.active_view {
                     ActiveView::Agent(id) => {
                         if let Some(agent) = app.agents.get_mut(&id)
                             && agent.should_restore_prompt_on_focus_gained()
                         {
-                            agent.set_active_pane(crate::views::agent::ActivePane::Prompt, false);
-                            needs_draw = true;
-                            had_non_resize_change = true;
+                            let needs_input = !agent.no_input_overlay_pending();
+                            if needs_input || external_focus {
+                                agent.set_active_pane(
+                                    crate::views::agent::ActivePane::Prompt,
+                                    false,
+                                );
+                                needs_draw = true;
+                                had_non_resize_change = true;
+                            }
                         }
 
                         // Automatic "where was I" recap: the user just returned
@@ -3454,6 +3467,7 @@ async fn drain_and_process(
                 return false;
             }
             Event::FocusLost => {
+                app.saw_focus_lost = true;
                 app.notification_service.focus_tracker.on_focus_lost();
                 // The /gboom game latches held keys until their release; a
                 // release can be lost while unfocused, so stop all movement.
@@ -3576,6 +3590,8 @@ async fn drain_and_process(
 
     for routed in &coalesced {
         if handle_one(routed) {
+            // One mouse reassert for the whole drain (incl. early quit).
+            super::flush_mouse_reassert_if_pending();
             return DrainResult {
                 needs_draw,
                 should_quit: true,
@@ -3588,6 +3604,9 @@ async fn drain_and_process(
             break;
         }
     }
+
+    // FocusGained × N + Resize in this batch → single mouse-only CSI write.
+    super::flush_mouse_reassert_if_pending();
 
     DrainResult {
         needs_draw,

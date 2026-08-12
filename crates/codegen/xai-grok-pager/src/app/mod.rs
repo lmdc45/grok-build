@@ -45,6 +45,7 @@ mod leader_cluster;
 mod modals;
 mod mouse;
 mod queue_edit;
+mod sticky_mouse_reassert;
 pub(crate) mod screen_mode_relaunch;
 mod session_load_barrier;
 pub mod signal_handler;
@@ -105,6 +106,53 @@ pub(crate) fn pop_gboom_keyboard_flags() {
 /// Tracks whether mouse capture (the five DEC modes enabled by
 /// crossterm `EnableMouseCapture` + bracketed paste) is currently active.
 pub(crate) static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Set once when the TUI finishes first enable (`note_tui_started`).
+/// Gates mouse reassert so init FocusGained cannot race first setup.
+static TUI_INPUT_MODES_READY: AtomicBool = AtomicBool::new(false);
+
+/// Record that the fullscreen TUI has enabled its desired input modes.
+/// Call from `signal_handler::install` / first init (after mouse enable).
+pub(crate) fn note_tui_started() {
+    TUI_INPUT_MODES_READY.store(true, Ordering::Release);
+}
+
+/// Mark that mouse modes may need repair (FocusGained / Resize).
+/// Does not write CSI; call [`flush_mouse_reassert_if_pending`] once per drain.
+#[inline]
+pub(crate) fn request_mouse_reassert() {
+    sticky_mouse_reassert::request_mouse_reassert();
+}
+
+/// Perform at most one mouse-only reassert if anything requested it this drain.
+///
+/// Desired-state model: while we own a fullscreen TUI and want mouse, re-send
+/// [`xai_crash_handler::MOUSE_ENABLE_SEQ`] only. No EnterAlternateScreen, no
+/// focus re-enable (`?1004` is set at startup; re-firing it storms CSI I).
+///
+/// Coalescing: N FocusGained+Resize in one drain → one write. Separate drains
+/// each get one write if requested (no wall-clock suppression of real recovery).
+pub(crate) fn flush_mouse_reassert_if_pending() {
+    // Consume pending *before* ownership/readiness guards:
+    // stale repair requests must not survive TUI teardown/re-init. If we no
+    // longer own the terminal (or mouse is off / TUI not ready), discard the
+    // request rather than leaving the bit set for a later wrong-context flush.
+    if !sticky_mouse_reassert::take_mouse_reassert_pending() {
+        return;
+    }
+    if !sticky_mouse_reassert::should_emit_mouse_repair(
+        signal_handler::is_terminal_owned(),
+        signal_handler::is_fullscreen(),
+        MOUSE_CAPTURE_ENABLED.load(Ordering::Acquire),
+        TUI_INPUT_MODES_READY.load(Ordering::Acquire),
+    ) {
+        return;
+    }
+    // Mouse DECSET only (no alt, no focus reporting).
+    xai_grok_shell::util::with_locked_stderr(|stderr| {
+        let _ = xai_crash_handler::write_mouse_enable(stderr);
+    });
+}
 /// Whether minimal was auto-selected solely because the terminal leaks mouse
 /// reports as raw text (JediTerm/Windows) and the user expressed no preference.
 /// Gates the idle-hint "auto-set" note so it never misleads users who chose
@@ -1131,10 +1179,13 @@ fn print_relaunch_failure_hint(
 ///
 /// Best-effort: failures are silently ignored since this runs on teardown
 /// and panic paths where stderr may already be broken.
+///
+/// Always emitted on teardown (not only when this process enabled mouse):
+/// bracketed paste is always enabled at init, and sticky `?100x` modes from a
+/// prior unclean exit must be cleared for ANSI hosts (xterm.js / ConPTY).
 fn disable_mouse_paste_raw() {
     xai_grok_shell::util::with_locked_stderr(|stderr| {
-        let _ = stderr.write_all(xai_crash_handler::terminal::MOUSE_PASTE_RESET);
-        let _ = stderr.flush();
+        let _ = xai_crash_handler::terminal::write_mouse_paste_reset(stderr);
     });
 }
 /// Set the console output code page to UTF-8 and enable
@@ -1378,9 +1429,18 @@ fn init_terminal(
     cursor_blink: Option<bool>,
 ) -> io::Result<TerminalInit> {
     xai_crash_handler::enable_terminal_escape_restore();
+    // Sync console-control path: VS Code Reload / tab close may only give
+    // CTRL_CLOSE_EVENT a few hundred ms; write RESTORE_SEQ before any async work.
+    let _ = xai_crash_handler::install_console_ctrl_restore();
+    // Clear sticky DEC modes from a prior unclean exit *before* raw mode /
+    // alt-screen. Dual-stream raw WriteFile so ConPTY/xterm.js sees CSI even
+    // when the File wrapper path is wrong after a Reload Window restore.
+    xai_crash_handler::clear_sticky_terminal_modes_raw();
     terminal::enable_raw_mode()?;
     #[cfg(windows)]
     configure_windows_console();
+    // Again after VTP is on (Windows stderr handle may need VTP to pass CSI).
+    xai_crash_handler::clear_sticky_terminal_modes_raw();
     let want_minimal = mode.is_minimal();
     let mut startup_typeahead: Vec<event_loop::TimedInputEvent> = Vec::new();
     let (terminal, screen_mode) = (|| -> io::Result<(PagerTerminal, ScreenMode)> {
@@ -1408,10 +1468,21 @@ fn init_terminal(
             win_native_selection::enable_native_selection();
         }
         xai_grok_shell::util::with_locked_stderr(|stderr| {
+            // Clear sticky *mouse* only — never RESTORE_SEQ here.
+            // RESTORE_SEQ includes leave-alt (`?1049l`); writing it after
+            // EnterAlternateScreen drops fullscreen and leaves the terminal
+            // scrollbar owning scroll (the grok_local "main buffer" bug).
+            // Full sticky clear already ran via clear_sticky_terminal_modes_raw
+            // *before* we entered alt-screen.
+            let _ = xai_crash_handler::terminal::write_mouse_tracking_reset(stderr);
+            let _ = stderr.flush();
             if !want_minimal {
+                // crossterm (winapi + ANSI) plus raw CSI so VS Code xterm.js
+                // always sees enables even if crossterm thinks modes are on.
                 execute!(stderr, event::EnableMouseCapture)?;
-            } else if crate::terminal::terminal_context().mouse_reporting_leaks_as_raw_text() {
-                let _ = stderr.write_all(xai_crash_handler::terminal::MOUSE_TRACKING_RESET);
+                let _ = stderr.write_all(
+                    b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h",
+                );
             }
             execute!(
                 stderr,
@@ -1419,6 +1490,11 @@ fn init_terminal(
                 event::EnableBracketedPaste,
                 cursor::Hide,
             )?;
+            // Ensure alt-screen still on after mouse CSI (defensive).
+            if mode.is_fullscreen() {
+                let _ = execute!(stderr, EnterAlternateScreen);
+            }
+            let _ = stderr.flush();
             let policy = cursor_style_policy(cursor_blink);
             match policy {
                 CursorStylePolicy::Inherit => {}
@@ -1599,9 +1675,13 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
         let _ = execute!(stderr, crossterm::terminal::EndSynchronizedUpdate);
     });
     crate::theme::reset_cursor_color();
+    // Always emit ANSI mouse+paste reset (see disable_mouse_paste_raw docs).
+    // On Windows also call winapi DisableMouseCapture when we enabled capture;
+    // that path is winapi-only and does not replace the ANSI write for xterm.js.
+    let mouse_was_enabled = MOUSE_CAPTURE_ENABLED.swap(false, Ordering::AcqRel);
     disable_mouse_paste_raw();
-    if MOUSE_CAPTURE_ENABLED.swap(false, Ordering::AcqRel) {
-        #[cfg(windows)]
+    #[cfg(windows)]
+    if mouse_was_enabled {
         xai_grok_shell::util::with_locked_stderr(|stderr| {
             let _ = execute!(stderr, event::DisableMouseCapture);
         });
@@ -1638,6 +1718,9 @@ fn emit_terminal_teardown_sequences(mode: ScreenMode, inline_cursor_row: Option<
     }
     #[cfg(windows)]
     win_native_selection::restore_stdin_mode();
+    // Last shot: raw dual-stream RESTORE_SEQ so xterm.js/ConPTY sees CSI even
+    // if earlier File-based writes were lost (writer thread race, VS Code).
+    xai_crash_handler::clear_sticky_terminal_modes_raw();
 }
 /// Consumes `terminal` and `writer_thread`: queues a final fullscreen clear,
 /// drains every accepted frame, then emits teardown sequences. Teardown still
@@ -1770,6 +1853,26 @@ mod tests {
         let toml_str = format!("[cli]\nuse_leader = {enabled}");
         toml::from_str(&toml_str).unwrap()
     }
+    #[test]
+    fn sticky_mouse_clear_bytes_match_crash_handler_contract() {
+        // Init always writes MOUSE_TRACKING_RESET as app output; if this
+        // constant changes, every host that still has sticky modes from an
+        // unclean exit must receive the same CSI set.
+        let mut buf = Vec::new();
+        xai_crash_handler::terminal::write_mouse_tracking_reset(&mut buf).unwrap();
+        assert_eq!(buf, xai_crash_handler::terminal::MOUSE_TRACKING_RESET);
+        for mode in [b"1000", b"1002", b"1003", b"1015", b"1006"] {
+            let mut needle = b"\x1b[?".to_vec();
+            needle.extend_from_slice(mode);
+            needle.push(b'l');
+            assert!(
+                buf.windows(needle.len()).any(|w| w == needle),
+                "init clear must disable ?{}",
+                std::str::from_utf8(mode).unwrap()
+            );
+        }
+    }
+
     #[test]
     fn terminal_title_strips_control_characters() {
         assert_eq!(

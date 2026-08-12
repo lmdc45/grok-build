@@ -94,11 +94,14 @@ impl AgentView {
     pub(crate) fn no_input_overlay_pending(&self) -> bool {
         self.blocking_card().is_none() && self.plan_approval_view.is_none()
     }
-    /// Whether FocusGained should move focus from Scrollback → Prompt.
+    /// Whether FocusGained *may* move focus from Scrollback → Prompt.
     ///
     /// Needs-input overlays (permission / plan / cancel-turn / question) always
-    /// win, independent of `vim_mode` and turn idle/busy. Otherwise, idle non-vim
-    /// restores Prompt so the user can type/paste after tabbing back.
+    /// win. Idle non-vim wants Prompt after **external** tab-back so the user
+    /// can type — the event loop only applies that branch after FocusLost
+    /// (see `AppView::saw_focus_lost`), so a click into scrollback is not
+    /// immediately undone by a spurious FocusGained while the terminal stays
+    /// focused.
     pub(crate) fn should_restore_prompt_on_focus_gained(&self) -> bool {
         if self.active_pane != AgentPane::Scrollback {
             return false;

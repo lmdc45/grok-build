@@ -108,6 +108,24 @@ pub fn enable_terminal_escape_restore() {
     handler::enable_terminal_escape_restore()
 }
 
+/// Install a Windows console-control handler. On CTRL_CLOSE does **not** write
+/// RESTORE_SEQ (process may survive Reload). See
+/// [`terminal::install_console_ctrl_restore`].
+pub fn install_console_ctrl_restore() -> bool {
+    terminal::install_console_ctrl_restore()
+}
+
+pub use terminal::{
+    decrqm_indicates_reset, decrqm_request, parse_decrqm_reply, write_mouse_enable,
+    write_reassert_display, MOUSE_ENABLE_SEQ, REASSERT_DISPLAY_SEQ,
+};
+
+/// Raw dual-stream sticky-mode clear (init + urgent teardown). See
+/// [`terminal::clear_sticky_terminal_modes_raw`].
+pub fn clear_sticky_terminal_modes_raw() {
+    terminal::clear_sticky_terminal_modes_raw()
+}
+
 /// Downgrade SIGSEGV/SIGBUS/SIGABRT handlers to termios-only restoration.
 /// Call when TUI modes are disabled.
 pub fn disable_terminal_escape_restore() {

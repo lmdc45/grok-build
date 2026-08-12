@@ -29,6 +29,11 @@ use super::ScreenMode;
 /// Whether the active screen mode is fullscreen. Set by [`install`].
 static SCREEN_MODE_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
+/// True while the pager is in fullscreen screen mode (alt-screen expected).
+pub(crate) fn is_fullscreen() -> bool {
+    SCREEN_MODE_FULLSCREEN.load(Ordering::Acquire)
+}
+
 /// Most recently active session ID for signal-handler cleanup.
 /// `parking_lot::Mutex` avoids poisoning in the `-> !` exit path.
 static CURRENT_SESSION_ID: parking_lot::Mutex<Option<acp::SessionId>> =
@@ -60,10 +65,17 @@ pub(crate) fn clear_quit_notify() {
 /// interact with this flag.
 static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
 
+/// True until clean teardown / panic-hook mark. Used to re-arm alt-screen +
+/// mouse after VS Code Reload soft-tears the host emulator while we survive.
+pub(crate) fn is_terminal_owned() -> bool {
+    TERMINAL_OWNED.load(Ordering::Acquire)
+}
+
 /// Install signal handlers for the TUI lifecycle. Call after `init_terminal`.
 pub(crate) fn install(mode: ScreenMode) {
     SCREEN_MODE_FULLSCREEN.store(mode.is_fullscreen(), Ordering::Release);
     TERMINAL_OWNED.store(true, Ordering::Release);
+    super::note_tui_started();
 
     // Ignore SIGTTIN/SIGTTOU so the pager can't be suspended if a
     // child process (or its grandchild) briefly steals the terminal's
@@ -75,6 +87,10 @@ pub(crate) fn install(mode: ScreenMode) {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
+
+    // Windows: also ensure the sync console-control handler is installed
+    // (idempotent; init_terminal already calls this). Covers Reload Window.
+    let _ = xai_crash_handler::install_console_ctrl_restore();
 
     spawn_async_signal_task();
 }
@@ -229,6 +245,11 @@ fn shutdown_with_terminal_restore(exit_code: i32) -> ! {
     if !TERMINAL_OWNED.load(Ordering::Acquire) {
         flush_telemetry_and_exit(exit_code);
     }
+    // Time-critical first: raw WriteFile/write(2) of RESTORE_SEQ with no
+    // locks. Windows CTRL_CLOSE_EVENT (VS Code tab close / Reload Window)
+    // and SIGTERM give only a short window before the process is killed;
+    // the fuller emit_terminal_teardown_sequences path may not finish.
+    xai_crash_handler::terminal::restore_in_signal_handler();
     let mode = if SCREEN_MODE_FULLSCREEN.load(Ordering::Acquire) {
         ScreenMode::Fullscreen
     } else {
