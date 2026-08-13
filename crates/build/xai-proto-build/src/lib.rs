@@ -126,11 +126,33 @@ impl XaiProtoBuilder {
         }
 
         // Can only process one input file when using --dependency_out=FILE.
+        // Unix uses /dev/stdout + /dev/null so cargo can capture deps without
+        // temp files. Windows has neither path; write deps to a temp file and
+        // discard the descriptor set into another temp (deleted after).
         for proto in protos {
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
-            command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+
+            // Windows: no /dev/stdout or /dev/null for protoc path args.
+            // Also: `--flag=C:\path` breaks because the drive colon is parsed as
+            // the option separator — use forward slashes (protoc accepts them).
+            #[cfg(windows)]
+            let (dep_path, desc_path) = {
+                let dir = std::env::temp_dir();
+                let stamp = std::process::id();
+                let dep = dir.join(format!("xai-proto-deps-{stamp}.d"));
+                let desc = dir.join(format!("xai-proto-desc-{stamp}.pb"));
+                let dep_arg = dep.to_string_lossy().replace('\\', "/");
+                let desc_arg = desc.to_string_lossy().replace('\\', "/");
+                command.arg(format!("--dependency_out={dep_arg}"));
+                command.arg(format!("--descriptor_set_out={desc_arg}"));
+                (dep, desc)
+            };
+            #[cfg(not(windows))]
+            {
+                command
+                    .arg("--dependency_out=/dev/stdout")
+                    .arg("--descriptor_set_out=/dev/null");
+            }
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -156,30 +178,62 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
+            #[cfg(windows)]
+            let dep_text = {
+                let text = fs::read_to_string(&dep_path).with_context(|| {
+                    format!("failed to read protoc deps file {}", dep_path.display())
+                })?;
+                let _ = fs::remove_file(&dep_path);
+                let _ = fs::remove_file(&desc_path);
+                text
+            };
+            #[cfg(not(windows))]
+            let dep_text =
                 String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
 
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
+            let mut lines = dep_text.lines();
+            let first_line = lines.next().context("protoc dependency output is empty")?;
+            // Makefile dep format: `target: dep1 dep2 \`
+            // On Unix the target is `/dev/null`. On Windows it is a real path
+            // like `C:/Temp/x.pb` — must NOT split on the drive-letter colon.
+            // Always split on the first `": "` (colon + space).
+            let rem = first_line
+                .split_once(": ")
+                .map(|(_, r)| r)
+                .or_else(|| {
+                    // Legacy `/dev/null:dep` with no space after colon.
+                    first_line
+                        .strip_prefix("/dev/null:")
+                        .or_else(|| first_line.strip_prefix("NUL:"))
+                })
+                .with_context(|| format!("protoc dep line missing 'target: deps': {dep_text:?}"))?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+                let line = line.strip_suffix('\\').unwrap_or(line).trim();
+                if line.is_empty() {
+                    continue;
+                }
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                if line.contains("/include/google/protobuf/")
+                    || line.contains("\\include\\google\\protobuf\\")
+                {
                     continue;
                 }
 
-                if !fs::exists(line)? {
-                    return Err(anyhow::anyhow!("dependency file not found: {line}"));
+                // Dep files may list several paths on one line separated by spaces.
+                for part in line.split_whitespace() {
+                    if part.contains("/include/google/protobuf/")
+                        || part.contains("\\include\\google\\protobuf\\")
+                    {
+                        continue;
+                    }
+                    if !fs::exists(part)? {
+                        return Err(anyhow::anyhow!("dependency file not found: {part}"));
+                    }
+                    println!("cargo:rerun-if-changed={part}");
                 }
-
-                println!("cargo:rerun-if-changed={line}");
             }
         }
 
