@@ -120,6 +120,15 @@ impl TitleManager {
         self.tick_count = 0;
         esc
     }
+
+    /// Forget the last emitted title so the next `update` re-sends OSC 0.
+    ///
+    /// Keep-process Reload restores the PTY but resets host tab chrome to the
+    /// shell name (`bash`). The process is still running and would otherwise
+    /// skip OSC because the composed title has not changed.
+    pub fn invalidate(&mut self) {
+        self.last_title.clear();
+    }
 }
 
 /// Render a single title item into `buf`. Returns `true` if a part was written.
@@ -654,6 +663,19 @@ mod tests {
         let title_before = mgr.last_title.clone();
         mgr.update(&state);
         assert_eq!(mgr.last_title, title_before);
+    }
+
+    #[test]
+    fn invalidate_forces_next_update_to_reemit() {
+        let cfg = config_with_items(vec![TitleItem::Grok]);
+        let mut mgr = TitleManager::new(&cfg);
+        let state = idle_state();
+        assert!(mgr.update(&state).is_some());
+        assert!(mgr.update(&state).is_none(), "dedup should hold");
+        mgr.invalidate();
+        let again = mgr.update(&state);
+        assert!(again.is_some(), "invalidate must re-send OSC 0");
+        assert!(again.unwrap().contains("grok"));
     }
 
     // --- Empty items list ---

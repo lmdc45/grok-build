@@ -71,6 +71,11 @@ impl NotificationService {
         &self.config
     }
 
+    /// Next title tick re-emits OSC 0 (keep-process Reload host chrome reset).
+    pub fn invalidate_tab_title(&mut self) {
+        self.title_manager.invalidate();
+    }
+
     pub fn protocol(&self) -> protocol::NotificationProtocol {
         self.protocol
     }

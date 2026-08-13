@@ -3373,6 +3373,9 @@ async fn drain_and_process(
             Event::FocusGained => {
                 // Coalesce mouse repair to one write at end of this drain.
                 super::request_mouse_reassert();
+                // Host keep-process Reload drops the OSC tab title; re-send
+                // on the next tick (same FocusGained that reasserts mouse).
+                app.notification_service.invalidate_tab_title();
                 // Force a full repaint on refocus to heal out-of-band stranded rows.
                 // Sets needs_draw (not had_non_resize_change); the draw site honors force_repaint
                 // ahead of the resize debounce, clearing even a coalesced same-size resize.
